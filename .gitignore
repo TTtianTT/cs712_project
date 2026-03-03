@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.DS_Store
+.idea/
+outputs/
+outputs_maskdiff/
+outputs_maskdiff_2stage/
+submission/
