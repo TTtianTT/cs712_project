@@ -1,202 +1,79 @@
-# LSH Masked Token Prediction
+# ngram_hybrid_v2.py
 
-This codebase implements:
+`ngram_hybrid_v2.py` is the final inference utility used to combine a stronger count-based baseline with the neural masked-token model.
 
-- `Baseline 1`: unigram prior over eligible tokens
-- `Baseline 2`: windowed co-occurrence scorer with add-k smoothing
-- `Main model`: tiny Transformer MLM with eligible-only softmax
-- `Bit-aware enhancement`: optional 32-bit auxiliary head
-- `Fusion inference`: neural log-probabilities plus co-occurrence scores and optional bit scores
-- `Best dev setup`: `n-gram v2` backoff model plus temperature-calibrated neural hybrid
-- `DDP training`: `torchrun` on `cuda:0,1,2,3`
+It does four things:
 
-## Files
+1. Build an improved n-gram model from the train split.
+2. Evaluate the pure n-gram baseline on labeled dev data.
+3. Evaluate the hybrid model on labeled dev data so `lambda_ng` and `nn_temp` can be tuned.
+4. Generate final validation predictions and an optional zip submission.
 
-- `data_utils.py`: file IO, token validation, deterministic train/dev split, bit/Hamming utilities, datasets
-- `baselines.py`: unigram and co-occurrence baselines
-- `models.py`: Transformer encoder MLM, bit head, and scoring helpers
-- `train.py`: train/dev split, baseline evaluation, dense masked-label training, DDP, checkpointing
-- `predict.py`: baseline, transformer, or fusion inference plus `pred.txt` and `pred.zip`
-- `ngram_hybrid.py`: first hybrid implementation with ctx4 -> ctx2 backoff
-- `ngram_hybrid_v2.py`: improved n-gram backoff, hybrid dev evaluation, and submission generation
+## What the script is doing
 
-## Data assumptions
+### 1. Stronger n-gram backoff
 
-- Tokens are always 8-char lowercase hex strings, so `k = 32` bits.
-- Validation lines contain exactly one literal `MASK`.
-- Predictions are always constrained to the eligible vocabulary in `vocab_eligible.txt`.
+The script builds a count-based model over eligible tokens only. For each masked position, it stores counts under these backoff contexts:
 
-## Method
+- `ctx4`: `(l2, l1, r1, r2)`
+- `ctx3L`: `(l2, l1, r1)`
+- `ctx3R`: `(l1, r1, r2)`
+- `ctx2`: `(l1, r1)`
+- `left1`: `l1`
+- `right1`: `r1`
+- `unigram`
 
-The strongest setup in this repo is a two-part hybrid rather than a larger neural model alone.
+At inference time it backs off in exactly that order. The extra `ctx3L` and `ctx3R` layers are the main difference from the earlier version and usually improve hit rate compared with jumping directly from `ctx4` to `ctx2`.
 
-1. `Neural scorer`
-   A Transformer masked-language model is trained with eligible-only prediction. The strongest training setup so far is the deterministic sentence-level split plus `all_single` masking, which gives one masked example per eligible position.
-2. `n-gram v2 scorer`
-   A separate count-based model is built on the same train split and stores counts for the masked token under progressively weaker contexts:
-   - `ctx4`: `(l2, l1, r1, r2)`
-   - `ctx3L`: `(l2, l1, r1)`
-   - `ctx3R`: `(l1, r1, r2)`
-   - `ctx2`: `(l1, r1)`
-   - `left1`: `l1`
-   - `right1`: `r1`
-   - `unigram`
-   Backoff follows that exact order. This extra `ctx3` layer improves hit rate compared with dropping directly from `ctx4` to `ctx2`. Each level uses add-`alpha` smoothing over the eligible vocabulary.
-3. `Hybrid scoring`
-   At inference time, the neural branch is calibrated with `log_softmax(logits / nn_temp)`. The final score for a candidate token is:
+All n-gram probabilities use add-`alpha` smoothing over the eligible vocabulary.
+
+### 2. Temperature-calibrated neural branch
+
+For the neural model, the script loads:
+
+- `meta.json`
+- `ckpt_best.pt` or another checkpoint
+
+It takes the logits at the `MASK` position, restricts them to the eligible vocabulary, and converts them to calibrated log-probabilities with:
+
+```text
+log_softmax(logits / nn_temp)
+```
+
+`nn_temp > 1` makes the neural distribution flatter, which often makes hybrid fusion more stable.
+
+### 3. Hybrid scoring
+
+The final hybrid score is:
 
 ```text
 score(token) = nn_logprob(token; nn_temp) + lambda_ng * ngram_logprob(token)
 ```
 
-   Candidate tokens are restricted to the union of neural top-`k_nn` and n-gram top-`k_ng`, then the best-scoring token is selected.
-4. `Dev tuning`
-   `ngram_hybrid_v2.py hybrid_eval` evaluates directly on `dev_labeled.tsv`, so `lambda_ng`, `nn_temp`, and optionally `alpha` can be tuned on the labeled dev split before generating the validation submission.
+- `lambda_ng = 0` means pure neural inference.
+- Larger `lambda_ng` makes the result closer to pure n-gram.
 
-## Masking strategies
+To keep inference efficient, the script only scores candidates from:
 
-Training supports:
+- neural top-`k_nn`
+- n-gram top-`k_ng`
 
-- `single`: one eligible position per sentence, one example per sentence
-- `all_single`: one example per eligible position, still single-mask per example
-- `ratio`: one multi-mask example per sentence, masking `max(1, round(mask_ratio * num_eligible_positions))` eligible positions
+It takes the union of those candidates and returns the highest-scoring token.
 
-Relevant flags:
+### 4. Direct dev evaluation
 
-- `--mask_strategy {single,all_single,ratio}`
-- `--mask_ratio 0.1` or `--mask_ratio 0.3` when `--mask_strategy=ratio`
+The key practical improvement is `hybrid_eval`: it evaluates the hybrid model directly on `dev_labeled.tsv`, so you can tune the fusion on labeled dev instead of guessing from validation outputs.
 
-The train/dev split stays sentence-level and deterministic.
-Model selection defaults to `--selection_metric harmonic_mean`, which matches the final leaderboard objective.
+It reports:
 
-## Train
+- `abs_acc`
+- optional `rel_acc`
 
-Recommended `all_single` run without the bit head:
+## Commands
 
-```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 train.py \
-  --data_dir /mnt/data/zailongtian/workspace/cs712_project/data \
-  --output_dir outputs/exp_all_single_nb0 \
-  --ddp 1 \
-  --num_gpus 4 \
-  --batch_size_per_gpu 64 \
-  --eval_batch_size 256 \
-  --mask_strategy all_single \
-  --selection_metric harmonic_mean \
-  --use_bit_head 0 \
-  --epochs 12 \
-  --patience 4 \
-  --lr 1e-4
-```
+### Build
 
-Requested comparison runs:
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 train.py \
-  --data_dir /mnt/data/zailongtian/workspace/cs712_project/data \
-  --output_dir outputs/exp_ratio01_nb0 \
-  --ddp 1 \
-  --num_gpus 4 \
-  --batch_size_per_gpu 128 \
-  --eval_batch_size 256 \
-  --mask_strategy ratio \
-  --mask_ratio 0.1 \
-  --selection_metric harmonic_mean \
-  --use_bit_head 0 \
-  --epochs 12 \
-  --patience 4 \
-  --lr 1e-4
-```
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 train.py \
-  --data_dir /mnt/data/zailongtian/workspace/cs712_project/data \
-  --output_dir outputs/exp_ratio03_nb0 \
-  --ddp 1 \
-  --num_gpus 4 \
-  --batch_size_per_gpu 128 \
-  --eval_batch_size 256 \
-  --mask_strategy ratio \
-  --mask_ratio 0.3 \
-  --selection_metric harmonic_mean \
-  --use_bit_head 0 \
-  --epochs 12 \
-  --patience 4 \
-  --lr 1e-4
-```
-
-Optional bit-head follow-up:
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 train.py \
-  --data_dir /mnt/data/zailongtian/workspace/cs712_project/data \
-  --output_dir outputs/exp_all_single_bit \
-  --ddp 1 \
-  --num_gpus 4 \
-  --batch_size_per_gpu 64 \
-  --eval_batch_size 256 \
-  --mask_strategy all_single \
-  --selection_metric harmonic_mean \
-  --use_bit_head 1 \
-  --alpha 0.1 \
-  --beta 0.0 \
-  --epochs 12 \
-  --patience 4 \
-  --lr 1e-4
-```
-
-Key outputs under `--output_dir`:
-
-- `baseline_metrics.json`
-- `train_history.jsonl`
-- `final_summary.json`
-- `best.ckpt.pt` or the file named by `--save_name`
-
-## Predict
-
-Co-occurrence baseline:
-
-```bash
-python predict.py \
-  --data_dir /mnt/data/zailongtian/workspace/cs712_project/data \
-  --predictor cooccurrence \
-  --window_size 4 \
-  --cooc_add_k 0.25 \
-  --out_name outputs/preds_cooccurrence/pred.txt
-```
-
-Transformer checkpoint only:
-
-```bash
-python predict.py \
-  --data_dir /mnt/data/zailongtian/workspace/cs712_project/data \
-  --predictor transformer \
-  --ckpt_path outputs/exp_all_single_nb0/best.ckpt.pt \
-  --out_name outputs/preds_transformer/pred.txt
-```
-
-Fusion predictor:
-
-```bash
-python predict.py \
-  --data_dir /mnt/data/zailongtian/workspace/cs712_project/data \
-  --predictor fusion \
-  --ckpt_path outputs/exp_all_single_nb0/best.ckpt.pt \
-  --gamma 0.1 \
-  --beta 0.0 \
-  --out_name /mnt/data/zailongtian/workspace/cs712_project/data/pred.txt
-```
-
-`predict.py` writes:
-
-- `pred.txt`: one eligible token per validation line
-- `pred.zip`: contains only `pred.txt`
-
-The `--out_name` path must end with `pred.txt`.
-
-## Best Hybrid Workflow
-
-Rebuild the stronger n-gram with `ctx3` backoff:
+Build the stronger n-gram model:
 
 ```bash
 python3 ngram_hybrid_v2.py build \
@@ -207,7 +84,9 @@ python3 ngram_hybrid_v2.py build \
   --alpha 0.1
 ```
 
-Check the pure n-gram baseline on labeled dev:
+### Eval
+
+Evaluate the pure n-gram baseline on labeled dev:
 
 ```bash
 python3 ngram_hybrid_v2.py eval \
@@ -215,7 +94,25 @@ python3 ngram_hybrid_v2.py eval \
   --labeled_tsv outputs_maskdiff_2stage/auto_dev/dev_labeled.tsv
 ```
 
-Sweep hybrid weights on labeled dev:
+Add `--relative` if you also want relative accuracy.
+
+### Hybrid Eval
+
+Evaluate the hybrid model on labeled dev:
+
+```bash
+python3 ngram_hybrid_v2.py hybrid_eval \
+  --ngram_model outputs_maskdiff_2stage/ngram_v2.pkl \
+  --meta outputs_maskdiff_2stage/meta.json \
+  --ckpt outputs_maskdiff_2stage/ckpt_best.pt \
+  --labeled_tsv outputs_maskdiff_2stage/auto_dev/dev_labeled.tsv \
+  --lambda_ng 1.5 \
+  --nn_temp 1.2 \
+  --k_nn 400 \
+  --k_ng 800
+```
+
+Typical dev sweep:
 
 ```bash
 for lam in 0 0.5 1 1.5 2 3 4; do
@@ -233,7 +130,9 @@ for lam in 0 0.5 1 1.5 2 3 4; do
 done
 ```
 
-Use the best dev setting to write the final submission:
+### Hybrid Predict
+
+Use the best dev setting to generate the final submission:
 
 ```bash
 python3 ngram_hybrid_v2.py hybrid_predict \
@@ -249,21 +148,27 @@ python3 ngram_hybrid_v2.py hybrid_predict \
   --k_ng 800
 ```
 
-`lambda_ng=0` is pure neural inference. Larger `lambda_ng` moves the prediction closer to pure n-gram. Values `nn_temp > 1` flatten the neural distribution and often make the fusion more stable.
+## Recommended workflow
 
-## Dev metrics
+1. Run `build` to rebuild the stronger n-gram model with `ctx3` backoff.
+2. Run `eval` to check the pure n-gram baseline on dev.
+3. Run `hybrid_eval` to sweep `lambda_ng` and `nn_temp` on `dev_labeled.tsv`.
+4. Run `hybrid_predict` with the best dev setting to produce `pred.txt` and `pred.zip`.
 
-`train.py` creates a deterministic sentence-level train/dev split from `train.txt`.
+## Inputs and outputs
 
-- Absolute accuracy: exact token match
-- Relative accuracy: `1 - HD(pred, truth) / 32`
-- Early stopping uses dev absolute accuracy
-- Relative accuracy and harmonic mean are also logged
+Main inputs:
 
-## Notes
+- training split text for n-gram counts
+- eligible vocabulary
+- labeled dev set
+- neural `meta.json`
+- neural checkpoint
+- validation text
 
-- The classifier head predicts only over eligible tokens, not the full train vocabulary.
-- Dense labels use `ignore_index=-100` for unmasked positions.
-- `ratio` masking trains on all masked positions in the sentence simultaneously.
-- Validation inference still predicts exactly one token because validation has exactly one `MASK` per line.
-- If `--max_len` is smaller than a sentence, cropping keeps the masked region in view.
+Main outputs:
+
+- `ngram_v2.pkl`
+- dev accuracy printed to stdout
+- `submission/pred.txt`
+- `submission/pred.zip`
